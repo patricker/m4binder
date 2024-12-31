@@ -168,14 +168,11 @@ def create_concat_list(file_paths, list_file):
             safe_path = safe_path.replace("'", "'\\''")
             f.write(f"file '{safe_path}'\n")
 
-def encode_mp3_to_m4a(mp3_file, out_file, bitrate="96k"):
+def encode_mp3_to_m4a(mp3_file, out_file):
     """
     Convert a single MP3 file to AAC (.m4a) without altering 
     sample rate/channels if possible.
     """
-    # if the output file already exists, skip encoding
-    if os.path.exists(out_file):
-        print(f"Output file {out_file} already exists. Skipping.")
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -184,12 +181,11 @@ def encode_mp3_to_m4a(mp3_file, out_file, bitrate="96k"):
         "-i", mp3_file,       # Input MP3
         "-vn",                # This drops any video/art track that might be embedded as H.264:
         "-c:a", "aac",
-        "-b:a", bitrate,
         out_file
     ]
     subprocess.run(cmd, check=True)
 
-def parallel_encode_mp3s_to_m4a(input_folder, output_folder, bitrate="96k", max_workers=None):
+def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
     """
     1) Finds all .mp3 in input_folder.
     2) Encodes each in parallel to .m4a in output_folder.
@@ -211,7 +207,7 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, bitrate="96k", max_
         for mp3 in mp3_files:
             basename = os.path.splitext(os.path.basename(mp3))[0]
             out_file = os.path.join(output_folder, basename + ".m4a")
-            fut = executor.submit(encode_mp3_to_m4a, mp3, out_file, bitrate)
+            fut = executor.submit(encode_mp3_to_m4a, mp3, out_file)
             futures[fut] = out_file
 
         # Gather results (this blocks until all are done)
@@ -234,7 +230,7 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
       3) Create concat list
       4) Use ffmpeg to produce final M4B
     """
-    m4a_files = parallel_encode_mp3s_to_m4a(input_folder, input_folder, bitrate="96k")
+    m4a_files = parallel_encode_mp3s_to_m4a(input_folder, input_folder)
 
     metadata_file = os.path.join(input_folder, "chapters.ffmetadata")
     list_file = os.path.join(input_folder, "concat_list.txt")

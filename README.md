@@ -175,7 +175,7 @@ python m4binder.py \
    - Open Library may not have an entry for your exact title/author. Ensure you’ve spelled them correctly, or use `--metadata-source none` to rely on embedded cover art.
 
 4. **High CPU Usage**  
-   - By default, the script parallelizes conversion of MP3 files (for faster performance). If your system is overloaded, you can add a `--max-workers N` argument (if you’ve exposed it in the script) to limit concurrency.
+   - By default, the script parallelizes conversion of MP3 files (for faster performance).
 
 ---
 

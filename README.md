@@ -157,9 +157,7 @@ python m4binder.py \
      --mode multiple \
      --input-folder /path/to/audiobooks \
      --output-folder /path/to/final_m4bs \
-     --metadata-source openlibrary \
-     --title "Placeholder Title" \
-     --author "Placeholder Author"
+     --metadata-source openlibrary
    ```
    If `--title` and `--author` are the same for all subfolders, the script will attempt to find metadata for each subfolder. If subfolders differ significantly, you may rely on each MP3’s ID3 tags or let Open Library do partial matching.
 

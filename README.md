@@ -79,7 +79,7 @@ Key arguments:
 | `--input-folder`       | The folder containing MP3 files (in **single** mode) or subfolders containing MP3 files (in **multiple** mode).                                                                  |
 | `--output-file`        | **(Single mode)** The M4B filename to create. Required in single mode.                                                                                                         |
 | `--output-folder`      | **(Multiple mode)** Where to place all final M4B files. If not specified, defaults to placing them in the same `--input-folder`.                                                 |
-| `--metadata-source`    | Source to fetch book metadata: **`openlibrary`** or **`none`**. (Google Books is omitted here by request.)                                                                      |
+| `--metadata-source`    | Source to fetch book metadata: **`openlibrary`** or **`none`**.                                                                                                                |
 | `--title` / `--author` | Used for metadata lookup if you choose `--metadata-source openlibrary`. If not provided, the script attempts to read ID3 tags from the first MP3 file.                          |
 
 ### Single Mode Example

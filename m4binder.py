@@ -121,7 +121,7 @@ def create_ffmetadata(files, metadata_file, book_metadata=None):
         if "title" in book_metadata:
             lines.append(f"title={book_metadata['title']}")
             lines.append(f"album={book_metadata['title']}")
-        if "authors" in book_metadata:
+        if "authors" in book_metadata and len(book_metadata['authors']) > 0 and book_metadata['authors'][0] is not None:
             lines.append(f"artist={', '.join(book_metadata['authors'])}")
             lines.append(f"album_artist={', '.join(book_metadata['authors'])}")
         if "publisher" in book_metadata:

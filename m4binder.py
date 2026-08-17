@@ -21,7 +21,6 @@ import sys
 import subprocess
 
 from mutagen.easyid3 import EasyID3
-from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC
 
 try:
@@ -73,15 +72,21 @@ def extract_embedded_cover_art(mp3_path):
     If found, saves it to a file (next to the MP3) and returns the file path.
     Otherwise returns None.
     """
-    # Load MP3 with ID3 tags
-    audio = MP3(mp3_path, ID3=ID3)
-    if not audio.tags:
+    # Use ID3() to read only the tag, avoiding MP3 audio-stream parsing
+    # which fails on files with non-standard MPEG framing (e.g. large
+    # 0xFF padding runs after the ID3v2 tag).
+    try:
+        audio = ID3(mp3_path)
+    except Exception:
+        return None
+
+    if not audio.keys():
         return None
 
     # Look for APIC (attached picture) frames
-    for tag_key in audio.tags.keys():
+    for tag_key in audio.keys():
         if tag_key.startswith("APIC"):
-            apic_frame = audio.tags[tag_key]
+            apic_frame = audio[tag_key]
             if isinstance(apic_frame, APIC):
                 # Determine a file extension based on MIME type (jpg, png, etc.)
                 mime_lower = apic_frame.mime.lower()

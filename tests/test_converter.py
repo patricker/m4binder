@@ -119,6 +119,27 @@ class ConversionTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg and ffprobe required")
 class FFmpegIntegrationTests(unittest.TestCase):
+    def test_batch_cli_defaults_output_folder_and_reports_existing_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            book = Path(folder, "My Book")
+            book.mkdir()
+            Path(folder, "Empty Book").mkdir()
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                            "sine=frequency=440:duration=0.2", str(book / "1.mp3")], check=True)
+            command = [os.sys.executable, str(Path(app.__file__).resolve()),
+                       "--mode", "multiple", "--input-folder", folder,
+                       "--metadata-source", "none", "--workers", "1", "--no-progress"]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = Path(folder, "My Book.m4b")
+            original = output.read_bytes()
+            self.assertNotIn("chapter/s", result.stderr)
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("already exists", result.stderr)
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(sorted(p.name for p in book.iterdir()), ["1.mp3"])
+
     def test_real_conversion_chapters_tags_and_source_preservation(self):
         with tempfile.TemporaryDirectory(prefix="book's audio ") as folder:
             for name, rate in (("2.MP3", "22050"), ("10.mp3", "44100")):

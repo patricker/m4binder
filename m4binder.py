@@ -6,7 +6,7 @@ CLI script that:
   3) Embeds that metadata in the final M4B.
 
 Usage:
-  python audiobook_converter.py \
+  python m4binder.py \
       --input-folder /path/to/chapters \
       --output-file mybook.m4b \
       --title "Dune" \
@@ -19,18 +19,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import sys
 import subprocess
+import math
+import re
+import shutil
+import tempfile
+from pathlib import Path
 
 from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC
 
-try:
-    from olclient.openlibrary import OpenLibrary
-    import olclient.common as ol_common
-except ImportError:
-    OpenLibrary = None
-
 import requests
+from tqdm import tqdm
 
 def get_duration(file_path):
     """
@@ -50,11 +50,30 @@ def get_duration(file_path):
         text=True
     )
 
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        print(f"Warning: Could not determine duration of {file_path}.")
-        return 0.0
+    result.check_returncode()
+    duration = float(result.stdout.strip())
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"Invalid audio duration: {file_path}")
+    return duration
+
+
+def natural_key(path):
+    """Order chapter 2 before chapter 10, consistently across platforms."""
+    return tuple((1, int(part)) if part.isdigit() else (0, part.casefold())
+                 for part in re.split(r"(\d+)", str(path)))
+
+
+def find_mp3s(folder):
+    return sorted((str(p.resolve()) for p in Path(folder).iterdir()
+                   if p.is_file() and p.suffix.lower() == ".mp3"),
+                  key=lambda p: (natural_key(p), p))
+
+
+def escape_metadata(value):
+    value = str(value or "")
+    for char in ("\\", "=", ";", "#", "\n"):
+        value = value.replace(char, "\\" + char)
+    return value.replace("\r", "")
 
 def extract_id3_tags(file_path):
     """Return basic ID3 title/artist from an MP3 file."""
@@ -67,14 +86,18 @@ def extract_id3_tags(file_path):
     except Exception:
         return {}
 
-def extract_embedded_cover_art(mp3_path):
+def extract_embedded_cover_art(mp3_path, output_folder=None):
     """
     Checks if an MP3 file has embedded cover art (APIC frame).
-    If found, saves it to a file (next to the MP3) and returns the file path.
+    If found, saves it in output_folder when supplied and returns its path.
     Otherwise returns None.
     """
     # Load MP3 with ID3 tags
-    audio = MP3(mp3_path, ID3=ID3)
+    try:
+        audio = MP3(mp3_path, ID3=ID3)
+    except Exception as exc:
+        print(f"[WARN] Could not read embedded cover: {exc}")
+        return None
     if not audio.tags:
         return None
 
@@ -97,7 +120,7 @@ def extract_embedded_cover_art(mp3_path):
                 # Build a file path in the same folder as the MP3
                 base_name = os.path.splitext(os.path.basename(mp3_path))[0]
                 cover_filename = f"{base_name}_cover{extension}"
-                cover_path = os.path.join(os.path.dirname(mp3_path), cover_filename)
+                cover_path = os.path.join(output_folder or os.path.dirname(mp3_path), cover_filename)
 
                 # Write out the image data
                 with open(cover_path, "wb") as f:
@@ -119,13 +142,14 @@ def create_ffmetadata(files, metadata_file, book_metadata=None):
     # If we have book metadata, inject it here.
     if book_metadata:
         if "title" in book_metadata:
-            lines.append(f"title={book_metadata['title']}")
-            lines.append(f"album={book_metadata['title']}")
+            lines.append(f"title={escape_metadata(book_metadata['title'])}")
+            lines.append(f"album={escape_metadata(book_metadata['title'])}")
         if "authors" in book_metadata and len(book_metadata['authors']) > 0 and book_metadata['authors'][0] is not None:
-            lines.append(f"artist={', '.join(book_metadata['authors'])}")
-            lines.append(f"album_artist={', '.join(book_metadata['authors'])}")
+            authors = escape_metadata(', '.join(a for a in book_metadata['authors'] if a))
+            lines.append(f"artist={authors}")
+            lines.append(f"album_artist={authors}")
         if "publisher" in book_metadata:
-            lines.append(f"publisher={book_metadata['publisher']}")
+            lines.append(f"publisher={escape_metadata(book_metadata['publisher'])}")
 
     current_start_ms = 0
     for idx, file_path in enumerate(files, start=1):
@@ -150,7 +174,7 @@ def create_ffmetadata(files, metadata_file, book_metadata=None):
         lines.append("TIMEBASE=1/1000")
         lines.append(f"START={chapter_start}")
         lines.append(f"END={chapter_end}")
-        lines.append(f"title={mp3_title}")
+        lines.append(f"title={escape_metadata(mp3_title)}")
 
         current_start_ms += duration_ms
 
@@ -170,22 +194,24 @@ def create_concat_list(file_paths, list_file):
 
 def encode_mp3_to_m4a(mp3_file, out_file):
     """
-    Convert a single MP3 file to AAC (.m4a) without altering 
-    sample rate/channels if possible.
+    Convert a single MP3 to AAC with a consistent sample rate and channel layout.
     """
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
+        "-nostdin",
         "-y",                 # Overwrite output
         "-i", mp3_file,       # Input MP3
         "-vn",                # This drops any video/art track that might be embedded as H.264:
         "-c:a", "aac",
+        "-ar", "44100",
+        "-ac", "2",
         out_file
     ]
     subprocess.run(cmd, check=True)
 
-def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
+def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None, progress=True):
     """
     1) Finds all .mp3 in input_folder.
     2) Encodes each in parallel to .m4a in output_folder.
@@ -194,15 +220,10 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder, exist_ok=True)
 
-    mp3_files = [
-        os.path.join(input_folder, f)
-        for f in os.listdir(input_folder)
-        if f.lower().endswith(".mp3")
-    ]
-    mp3_files.sort()
+    mp3_files = find_mp3s(input_folder)
 
     results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers or min(4, os.cpu_count() or 1)) as executor:
         futures = {}
         for mp3 in mp3_files:
             basename = os.path.splitext(os.path.basename(mp3))[0]
@@ -211,18 +232,38 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
             futures[fut] = out_file
 
         # Gather results (this blocks until all are done)
-        for fut in as_completed(futures):
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Encoding chapters",
+                        unit="chapter", disable=not progress):
             out_file = futures[fut]
             try:
                 fut.result()  # Will raise CalledProcessError if FFmpeg fails
                 results.append(out_file)
             except Exception as e:
-                print(f"Error encoding {out_file}: {e}")
+                raise RuntimeError(f"Error encoding {out_file}: {e}") from e
 
     # Return sorted list of .m4a files
-    return sorted(results), mp3_files
+    return sorted(results, key=lambda p: (natural_key(p), p)), mp3_files
 
-def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
+def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None,
+                                max_workers=None, progress=True):
+    """Publish only a complete book, preserving existing output files."""
+    output = Path(output_file).resolve()
+    if output.exists():
+        raise FileExistsError(f"Output already exists: {output}. Choose a new filename.")
+    if not find_mp3s(input_folder):
+        raise ValueError(f"No MP3 files found in {input_folder}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="m4binder-", dir=output.parent) as work:
+        staged = os.path.join(work, "audiobook.m4b")
+        _convert_mp3_chapters(input_folder, staged, book_metadata, work,
+                              max_workers=max_workers, progress=progress)
+        # Atomic publication that refuses to overwrite an existing file.
+        os.link(staged, output)
+    print(f"Created audiobook: {output}")
+
+
+def _convert_mp3_chapters(input_folder, output_file, book_metadata, work,
+                          max_workers=None, progress=True):
     """
     Main conversion flow:
       1) Find MP3s
@@ -230,11 +271,13 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
       3) Create concat list
       4) Use ffmpeg to produce final M4B
     """
-    m4a_files, mp3_files = parallel_encode_mp3s_to_m4a(input_folder, input_folder)
+    m4a_files, mp3_files = parallel_encode_mp3s_to_m4a(
+        input_folder, work, max_workers=max_workers, progress=progress)
 
-    metadata_file = os.path.join(input_folder, "chapters.ffmetadata")
-    list_file = os.path.join(input_folder, "concat_list.txt")
+    metadata_file = os.path.join(work, "chapters.ffmetadata")
+    list_file = os.path.join(work, "concat_list.txt")
 
+    print("[INFO] Building chapter markers...")
     create_ffmetadata(mp3_files, metadata_file, book_metadata=book_metadata)
     create_concat_list(m4a_files, list_file)
 
@@ -243,6 +286,8 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
+        "-nostdin",
+        "-n",
         "-f", "concat",
         "-safe", "0",
         "-i", list_file,
@@ -256,6 +301,7 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
     # 3) Now specify the mapping for each input and output options
     ffmpeg_cmd += [
         "-map_metadata", "1",  # the second input (metadata file)
+        "-map_chapters", "1",
         "-map", "0:a",         # the first input (audio from concat list)
         "-c", "copy",
         "-movflags", "faststart"
@@ -275,10 +321,10 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
     ffmpeg_cmd.append(output_file)
 
     try:
+        print("[INFO] Assembling audiobook and optimizing playback; please wait...")
         subprocess.run(ffmpeg_cmd, check=True)
-        print(f"Created audiobook: {output_file}")
     except subprocess.CalledProcessError as e:
-        print(f"Error converting MP3 chapters to M4B: {e}")
+        raise RuntimeError(f"Error assembling audiobook: {e}") from e
     finally:
         # Clean up
         if os.path.exists(metadata_file):
@@ -288,7 +334,7 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
         for m4a in m4a_files:
             os.remove(m4a)
 
-def get_book_metadata(args, mp3_files):
+def get_book_metadata(args, mp3_files, work_folder=None):
     """
     1) If user wants metadata from Google/OpenLibrary, fetch it.
     2) Otherwise, extract from first MP3 (ID3 tags) or fallback to defaults.
@@ -315,7 +361,7 @@ def get_book_metadata(args, mp3_files):
         book_meta = fetch_metadata_openlibrary(
             title=args.title or default_title,
             author=args.author or default_author,
-            input_folder=os.path.dirname(mp3_files[0])  # store cover near first MP3
+            input_folder=work_folder or os.path.dirname(mp3_files[0])
         )
     else:
         book_meta = None
@@ -325,13 +371,19 @@ def get_book_metadata(args, mp3_files):
         print(book_meta)
     else:
         # fallback: embedded cover from first MP3
-        cover_art = extract_embedded_cover_art(mp3_files[0])
+        cover_art = extract_embedded_cover_art(mp3_files[0], work_folder)
         book_meta = {
             "title": args.title or default_title,
             "authors": [args.author or default_author],
             "publisher": "",
             "cover": cover_art
         }
+    # Explicit user values take precedence over online matches.
+    book_meta["title"] = args.title or book_meta.get("title") or default_title or Path(mp3_files[0]).parent.name
+    book_meta["authors"] = ([args.author] if args.author else
+                            book_meta.get("authors") or ([default_author] if default_author else []))
+    if not book_meta.get("cover") and args.metadata_source != "none":
+        book_meta["cover"] = extract_embedded_cover_art(mp3_files[0], work_folder)
     return book_meta
 
 def fetch_metadata_google_books(title=None, author=None, isbn=None, api_key=None):
@@ -356,8 +408,13 @@ def fetch_metadata_google_books(title=None, author=None, isbn=None, api_key=None
     if api_key:
         params["key"] = api_key
 
-    resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params)
-    data = resp.json()
+    try:
+        resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[WARN] Google Books lookup failed; using local tags: {exc}")
+        return None
 
     items = data.get("items", [])
     if not items:
@@ -375,47 +432,62 @@ def fetch_metadata_google_books(title=None, author=None, isbn=None, api_key=None
     return metadata
 
 def fetch_metadata_openlibrary(title=None, author=None, input_folder=None):
-    """
-    Example stub using openlibrary-client (Requires pip install openlibrary-client).
-    You’ll need to adapt this to your actual usage pattern:
-      e.g., searching by ISBN, or calling the .get() method, etc.
-    """
-    if not OpenLibrary:
-        print("[WARN] openlibrary-client not installed. Skipping.")
+    """Search the public API with bounded requests and a local metadata fallback."""
+    if not title and not author:
         return None
-
     print("[INFO] Fetching metadata from Open Library...")
-    ol = OpenLibrary()
-    work_result = ol.Work.search(title=title, author=author)
-    if not work_result:
-        print("[WARN] No results from Open Library.")
+    params = {"limit": 1, "fields": "title,author_name,publisher,cover_i"}
+    if title:
+        params["title"] = title
+    if author:
+        params["author"] = author
+    try:
+        response = requests.get("https://openlibrary.org/search.json", params=params,
+                                timeout=15, headers={"User-Agent": "m4binder/1.0"})
+        response.raise_for_status()
+        docs = response.json().get("docs", [])
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[WARN] Open Library lookup failed; using local tags: {exc}")
         return None
-    work = ol.Work.get(work_result.identifiers['olid'][0])
-
-    # Covers are downloaded (with redirect following) using this format:
-    # https://covers.openlibrary.org/b/id/{cover_id}-L.jpg
-    cover_id = work.covers[0] if len(work.covers) > 0 else None
-    cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else None
-    # Fetch the cover image
-    if cover_url:
-        cover_resp = requests.get(cover_url, allow_redirects=True)
-        cover_path = f"{input_folder}/{cover_id}-cover.jpg"
-        with open(cover_path, 'wb') as f:
-            f.write(cover_resp.content)
-        print(f"[INFO] Saved cover image to {cover_path}")
+    if not docs:
+        print("[WARN] No results from Open Library; using local tags.")
+        return None
+    book = docs[0]
+    cover_path = None
+    cover_id = book.get("cover_i")
+    if cover_id and input_folder:
+        try:
+            response = requests.get(f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg?default=false",
+                                    timeout=15)
+            response.raise_for_status()
+            cover_path = os.path.join(input_folder, "openlibrary-cover.jpg")
+            with open(cover_path, "wb") as cover:
+                cover.write(response.content)
+        except (requests.RequestException, OSError) as exc:
+            print(f"[WARN] Could not download cover: {exc}")
+            cover_path = None
     return {
-        "title": work_result.title,
-        "authors": [auth['name'] for auth in work_result.authors],
-        "publisher": getattr(work_result, 'publisher', '') or '',
-        "cover": cover_path if cover_url else None,
+        "title": book.get("title"),
+        "authors": book.get("author_name") or [],
+        "publisher": ", ".join(book.get("publisher") or []),
+        "cover": cover_path,
     }
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert MP3 chapters to M4B with optional metadata fetching."
+        description="Convert naturally sorted MP3 chapters to an M4B audiobook.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Examples:
+  python m4binder.py --input-folder "My Book" --output-file "My Book.m4b" --metadata-source none
+  python m4binder.py --mode multiple --input-folder "Books" --output-folder "Converted"
+  python m4binder.py --input-folder "My Book" --workers 1 --no-progress
+
+Requires ffmpeg and ffprobe on PATH. Only immediate MP3 files are read.
+Progress updates when each chapter finishes; final assembly follows encoding.
+Existing outputs are refused. See README.md for setup and troubleshooting.'''
     )
     parser.add_argument("--input-folder", required=True, help="Folder containing MP3 chapters.")
-    parser.add_argument("--output-file", help="Output M4B filename (used in single mode).")
+    parser.add_argument("--output-file", help="Single mode output (default: folder name.m4b in current directory).")
 
     # New mode argument
     parser.add_argument("--mode",
@@ -426,35 +498,44 @@ def main():
     parser.add_argument("--metadata-source", default="openlibrary",
                         choices=["google", "openlibrary", "none"],
                         help="Source to fetch book metadata.")
-    parser.add_argument("--title", help="Book title (for metadata lookup).")
-    parser.add_argument("--author", help="Book author (for metadata lookup).")
-    parser.add_argument("--output-folder", help="Where to place M4B files in nested mode")
+    parser.add_argument("--title", help="Book title override, also used for online lookup.")
+    parser.add_argument("--author", help="Book author override, also used for online lookup.")
+    parser.add_argument("--output-folder", help="Multiple mode destination (default: input folder).")
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                        help="Parallel FFmpeg processes (default: up to 4).")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable progress bars for logs or automation.")
 
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+
+    if not os.path.isdir(args.input_folder):
+        parser.error(f"Input folder does not exist: {args.input_folder}")
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            parser.error(f"{tool} is missing. Install FFmpeg and add its bin folder to PATH.")
+    args.output_folder = args.output_folder or args.input_folder
 
     # ============== SINGLE MODE ==============
     if args.mode == "single":
-        mp3_files = [
-            os.path.join(args.input_folder, f)
-            for f in os.listdir(args.input_folder)
-            if f.lower().endswith(".mp3")
-        ]
-        mp3_files.sort()
+        mp3_files = find_mp3s(args.input_folder)
 
         if not mp3_files:
             print("[ERROR] No MP3 files found in input folder.")
             sys.exit(1)
 
         # Build metadata
-        book_meta = get_book_metadata(args, mp3_files)
-
         # If output-file not specified, pick a default
         if not args.output_file:
             # e.g. the folder name + ".m4b"
             folder_name = os.path.basename(args.input_folder.rstrip(os.sep))
             args.output_file = folder_name + ".m4b"
 
-        convert_mp3_chapters_to_m4b(args.input_folder, args.output_file, book_metadata=book_meta)
+        with tempfile.TemporaryDirectory(prefix="m4binder-metadata-") as work:
+            book_meta = get_book_metadata(args, mp3_files, work)
+            convert_mp3_chapters_to_m4b(args.input_folder, args.output_file, book_metadata=book_meta,
+                                        max_workers=args.workers, progress=not args.no_progress)
 
     # ============== MULTIPLE MODE ==============
     else:
@@ -468,13 +549,12 @@ def main():
             print("[ERROR] No subfolders found in input folder for 'multiple' mode.")
             sys.exit(1)
 
-        for subdir in subfolders:
-            mp3_files = [
-                os.path.join(subdir, f)
-                for f in os.listdir(subdir)
-                if f.lower().endswith(".mp3")
-            ]
-            mp3_files.sort()
+        book_folders = [d for d in sorted(subfolders, key=natural_key) if find_mp3s(d)]
+        if not book_folders:
+            parser.error("No MP3 files found in any immediate subfolder.")
+        for subdir in tqdm(book_folders, desc="Converting books", unit="book",
+                           disable=args.no_progress):
+            mp3_files = find_mp3s(subdir)
 
             if not mp3_files:
                 print(f"[WARN] No MP3 files in subfolder: {subdir}. Skipping.")
@@ -483,14 +563,22 @@ def main():
             print(f"[INFO] Converting subfolder: {subdir}")
 
             # Build metadata
-            book_meta = get_book_metadata(args, mp3_files)
-
             # Construct output filename for each subfolder
             folder_name = os.path.basename(subdir.rstrip(os.sep))
             output_m4b = os.path.join(args.output_folder, folder_name + ".m4b")
 
-            convert_mp3_chapters_to_m4b(subdir, output_m4b, book_metadata=book_meta)
+            with tempfile.TemporaryDirectory(prefix="m4binder-metadata-") as work:
+                book_meta = get_book_metadata(args, mp3_files, work)
+                convert_mp3_chapters_to_m4b(subdir, output_m4b, book_metadata=book_meta,
+                                            max_workers=args.workers, progress=not args.no_progress)
             print(f"[INFO] Finished subfolder -> {output_m4b}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[ERROR] Conversion interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)

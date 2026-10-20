@@ -1,184 +1,188 @@
-# MP3-to-M4B Converter
+# m4binder
 
-A Python CLI script that converts folder(s) of MP3 chapters into an M4B audiobook, optionally embedding chapter metadata and cover art. It can also fetch metadata from Open Library (e.g., title, author, cover). This script supports two modes:
+Convert MP3 chapter folders into M4B audiobooks with chapter markers, book tags,
+optional cover art, and progress bars. Convert one book or a collection.
 
-1. **Single** – Convert all MP3 files in **one folder** into a single M4B.  
-2. **Multiple** – For each **subfolder** in the input folder, convert MP3 files within that subfolder into its own M4B.
+## Install
 
----
+You need Python 3.9+ and FFmpeg **including ffprobe** on your terminal's PATH.
 
-## Table of Contents
-- [MP3-to-M4B Converter](#mp3-to-m4b-converter)
-  - [Table of Contents](#table-of-contents)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Usage](#usage)
-    - [Single Mode Example](#single-mode-example)
-    - [Multiple Mode Example](#multiple-mode-example)
-  - [Metadata Source](#metadata-source)
-  - [Examples](#examples)
-  - [Troubleshooting](#troubleshooting)
-  - [License](#license)
+- Windows: install Python from https://www.python.org/downloads/ and enable its
+  PATH option. Get a Windows FFmpeg build via https://ffmpeg.org/download.html,
+  extract it, and add the folder containing `ffmpeg.exe` and `ffprobe.exe` to your
+  user PATH. Reopen your terminal after changing PATH.
+- macOS with Homebrew: `brew install python ffmpeg`.
+- Ubuntu/Debian: `sudo apt update` then `sudo apt install python3 python3-venv ffmpeg`.
 
----
+Check the installation:
 
-## Prerequisites
-
-1. **FFmpeg**  
-   You must have [FFmpeg](https://www.ffmpeg.org/download.html) installed and in your system’s PATH. This script relies on FFmpeg for audio processing (encoding, merging, adding metadata).
-
-2. **Python 3.7+**  
-   - If you don’t already have Python, install it from [python.org/download/releases/](https://www.python.org/download/releases/).  
-
-3. **Pip & Requirements**  
-   The script has some Python dependencies, so you’ll want to install them from `requirements.txt`.
-
----
-
-## Installation
-
-1. **Install FFmpeg**  
-   Follow the [official FFmpeg download guide](https://www.ffmpeg.org/download.html) for your operating system (Windows, macOS, Linux).  
-   - Once installed, confirm `ffmpeg` is accessible by running:
-     ```bash
-     ffmpeg -version
-     ```
-   - If FFmpeg is not found, ensure your environment variables are set so that the `ffmpeg` command is recognized.
-
-2. **Install Python 3.7+**  
-   - If you need Python, go to [python.org/download/releases/](https://www.python.org/download/releases/) and download/install the latest version.
-
-3. **Clone or Download This Repository**  
-   - If you have Git:
-     ```bash
-     git clone https://github.com/your_username/mp3-to-m4b-converter.git
-     ```
-   - Or simply download the ZIP and extract.
-
-4. **Install Python Dependencies**  
-   In the project directory, run:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
----
-
-## Usage
-
-Run the script directly from your terminal using Python:
-
-```bash
-python m4binder.py [OPTIONS]
+```text
+python --version
+ffmpeg -version
+ffprobe -version
 ```
 
-Key arguments:
+Use `python3` on macOS/Linux before activating the environment, or `py` on
+Windows if `python` is unavailable.
 
-| Argument               | Description                                                                                                                                                                     |
-|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--mode`               | **single** (default) or **multiple**. In single mode, converts all MP3s in one folder into **one** M4B. In multiple mode, each subfolder is treated as a separate book.             |
-| `--input-folder`       | The folder containing MP3 files (in **single** mode) or subfolders containing MP3 files (in **multiple** mode).                                                                  |
-| `--output-file`        | **(Single mode)** The M4B filename to create. Required in single mode.                                                                                                         |
-| `--output-folder`      | **(Multiple mode)** Where to place all final M4B files. If not specified, defaults to placing them in the same `--input-folder`.                                                 |
-| `--metadata-source`    | Source to fetch book metadata: **`openlibrary`** or **`none`**.                                                                                                                |
-| `--title` / `--author` | Used for metadata lookup if you choose `--metadata-source openlibrary`. If not provided, the script attempts to read ID3 tags from the first MP3 file.                          |
-
-### Single Mode Example
-You have a folder containing MP3 files for “My Book.” Run:
-
-```bash
-python m4binder.py \
-  --mode single \
-  --input-folder /path/to/mybook_mp3s \
-  --output-file /path/to/output/mybook.m4b \
-  --metadata-source openlibrary \
-  --title "My Book Title" \
-  --author "John Doe"
+```text
+git clone https://github.com/Amir8-5/m4binder.git
+cd m4binder
+python -m venv .venv
 ```
 
-- **`--mode single`** indicates we’re converting one folder of MP3s into one M4B.  
-- **`--title`** and **`--author`** (optional) help fetch metadata, including cover art, from Open Library.
+Activate the environment for your shell:
 
-### Multiple Mode Example
-You have a folder containing multiple subfolders, each with its own set of MP3 files. For example:
+- PowerShell: `.\.venv\Scripts\Activate.ps1`
+- Command Prompt: `.venv\Scripts\activate.bat`
+- macOS/Linux: `source .venv/bin/activate`
 
-```
-/path/to/audiobooks/
-   ├── Book1/
-   │    ├── 01.mp3
-   │    ├── 02.mp3
-   │    └── ...
-   ├── Book2/
-   │    ├── 01.mp3
-   │    ├── 02.mp3
-   │    └── ...
-   └── Book3/
-        ├── 01.mp3
-        ├── 02.mp3
-        └── ...
+If PowerShell blocks activation, use `.\.venv\Scripts\python.exe` instead of
+`python` below. Activation is optional and no policy change is needed.
+
+```text
+python -m pip install -r requirements.txt
+python m4binder.py --help
 ```
 
-To convert **each** of these subfolders into a separate `.m4b`, run:
+Requirements install Mutagen, Requests, and tqdm. Install FFmpeg separately.
+No Open Library account, API key, or Git-installed Python dependency is needed.
 
-```bash
-python m4binder.py \
-  --mode multiple \
-  --input-folder /path/to/audiobooks \
-  --output-folder /path/to/converted_audiobooks \
-  --metadata-source openlibrary
+## Prepare the chapters
+
+```text
+Audiobooks/
+  My Book/
+    1.mp3
+    2.mp3
+    10.mp3
+  Another Book/
+    01 - Introduction.MP3
+    02 - Chapter One.mp3
 ```
 
-- Each subfolder (Book1, Book2, Book3) will be processed into its own `.m4b` in `/path/to/converted_audiobooks`.
+Files sort naturally by filename (`1`, `2`, `10`). MP3 extensions are case
+insensitive. Each chapter title uses its MP3 ID3 title tag, falling back to
+`Chapter 1`, `Chapter 2`, etc. Scanning is not recursive; chapters must be directly
+inside each book folder. Other formats are ignored.
 
----
+## Convert one book
 
-## Metadata Source
+Commands below fit on one line in PowerShell, Command Prompt, and Bash. Replace
+quoted paths with your own paths. Start offline:
 
-- **`openlibrary`**: Attempts to fetch official metadata (title, authors, cover art, etc.) from Open Library.  
-- **`none`**: Skips online metadata. The script will attempt to read embedded ID3 tags (like cover art) from the first MP3 file in each set. If no tags are found, it’ll default to generic placeholders.
+```text
+python m4binder.py --input-folder "Audiobooks/My Book" --output-file "Converted/My Book.m4b" --metadata-source none
+```
 
-> **Note**: If you omit `--title` and/or `--author`, the script will try to read those values from the **first MP3** file’s ID3 tags.
+Set the title and author yourself:
 
----
+```text
+python m4binder.py --input-folder "Audiobooks/My Book" --output-file "Converted/My Book.m4b" --metadata-source none --title "My Book" --author "Jane Smith"
+```
 
-## Examples
+Try an online lookup with cover art:
 
-1. **Quick Single-Folder Conversion Without Metadata**  
-   ```bash
-   python m4binder.py \
-     --mode single \
-     --metadata-source none \
-     --input-folder /path/to/book_mp3s \
-     --output-file /path/to/output/book.m4b
-   ```
+```text
+python m4binder.py --input-folder "Audiobooks/My Book" --output-file "Converted/My Book.m4b" --metadata-source openlibrary --title "My Book" --author "Jane Smith"
+```
 
-2. **Multiple-Folder Conversion with OpenLibrary**  
-   ```bash
-   python m4binder.py \
-     --mode multiple \
-     --input-folder /path/to/audiobooks \
-     --output-folder /path/to/final_m4bs \
-     --metadata-source openlibrary
-   ```
-   If `--title` and `--author` are the same for all subfolders, the script will attempt to find metadata for each subfolder. If subfolders differ significantly, you may rely on each MP3’s ID3 tags or let Open Library do partial matching.
+Without `--output-file`, the book is named after the input folder and written to
+your **current working directory**. Output parent folders are created for you.
+Existing outputs are refused; choose a new filename or move the old book first.
 
----
+## Convert a collection
+
+```text
+python m4binder.py --mode multiple --input-folder "Audiobooks" --output-folder "Converted" --metadata-source none
+```
+
+Each immediate subfolder containing MP3s becomes a book, for example
+`Converted/My Book.m4b`. Empty subfolders are skipped. Without `--output-folder`,
+outputs go directly into `Audiobooks`.
+
+A failed book stops the batch with a nonzero exit status. Earlier completed books
+remain available; move their output files before rerunning the same batch.
+Leave `--title` and `--author` unset for different books so each uses its own tags.
+Explicit values apply to **every** book in the batch.
+
+## Progress and CPU controls
+
+- `Encoding chapters` reports completed chapters, elapsed time, and estimated
+  remaining time. It updates when an entire chapter finishes, so a long chapter
+  can take time before the first update.
+- Batch mode also shows `Converting books`.
+- Chapter marker generation and final assembly print stage messages. Assembly
+  and playback optimization have no percentage estimate and can take time.
+  Encoding at 100% is followed by assembly: wait for `Created audiobook`.
+- Up to four FFmpeg processes run concurrently by default. Use `--workers 1`
+  for lower CPU/memory use, or another positive number for your machine.
+- `--no-progress` hides bars for automation and redirected logs; stage messages
+  and errors remain visible.
+
+```text
+python m4binder.py --input-folder "Audiobooks/My Book" --output-file "Converted/My Book.m4b" --metadata-source none --workers 2 --no-progress
+```
+
+AAC encoding uses 44.1 kHz stereo to make chapters compatible for concatenation.
+MP3-to-AAC conversion is lossy. Sources are preserved. Allow enough free space on
+the output drive for intermediate audio plus the finished book. Audio temporary
+files are cleaned up after success or ordinary failure. CLI cover images also
+use temporary storage. Force-killing Python or a shutdown can leave temporary
+folders behind.
+
+## Metadata choices
+
+- `openlibrary` (default): search Open Library for tags and cover art. The first
+  result can be another edition; verify the finished book's tags and cover.
+- `google`: search Google Books for tags. No online cover is downloaded in this mode.
+- `none`: use local ID3 tags and embedded artwork without contacting a service.
+
+Explicit `--title` and `--author` override lookup results. Otherwise the first
+naturally sorted MP3 supplies album/artist tags for lookup and fallback. The
+folder name is the final title fallback. Failed or empty lookups fall back to
+local tags. If no online cover is available, readable embedded art from the first
+MP3 is used. Chapter titles always use local ID3 tags.
+
+Requests time out after 15 seconds each; cover retrieval is a separate request.
+A missing cover does not prevent conversion.
 
 ## Troubleshooting
 
-1. **FFmpeg Not Found**  
-   - Ensure `ffmpeg` is installed and on your system’s PATH. You can verify by running `ffmpeg -version`.
+- **Missing ffmpeg/ffprobe:** verify both commands in the same terminal running
+  Python. Add FFmpeg's `bin` directory to PATH, then reopen your terminal.
+- **No MP3s:** check your path and folder layout. Single mode reads only the input
+  folder; multiple mode reads only its immediate book subfolders.
+- **Output already exists:** choose a new filename or move the existing output.
+  There is no overwrite prompt.
+- **Encoding/duration error:** check FFmpeg's error and verify the named MP3 plays.
+  A failed chapter aborts the book instead of silently being omitted.
+- **Progress pauses:** bars advance per completed chapter. Final assembly can
+  also take time; check the stage message.
+- **High CPU usage:** reduce `--workers` to `1` or `2`.
+- **Space/permission error:** select a writable output directory with space for
+  intermediate audio and the final book. Final publication uses a hard link;
+  the filesystem must support hard links, such as NTFS, APFS, or ext4. Convert
+  to a compatible local drive first if your removable/network drive cannot.
+- **Wrong metadata:** supply explicit title/author, or use `--metadata-source none`
+  and edit your source ID3 tags before conversion.
 
-2. **No MP3 Files Detected**  
-   - Double-check your input folder paths. Make sure files actually have the `.mp3` extension.
+Exit status: `1` for conversion errors, `2` for invalid arguments, `130` for Ctrl+C.
 
-3. **Metadata Not Found / Covers Missing**  
-   - Open Library may not have an entry for your exact title/author. Ensure you’ve spelled them correctly, or use `--metadata-source none` to rely on embedded cover art.
+## Development
 
-4. **High CPU Usage**  
-   - By default, the script parallelizes conversion of MP3 files (for faster performance).
+```text
+python -m unittest discover -s tests -v
+git diff --check
+```
 
----
+Unit tests cover ordering, failed jobs, cleanup, metadata escaping/fallback,
+output preservation, and progress. Integration tests generate short MP3s with
+FFmpeg and inspect the M4B with ffprobe; they are skipped if either executable
+is unavailable. Tests use generated audio and mocked online responses, so they
+need no network access.
 
 ## License
 
-This project is provided under the [MIT License](./LICENSE) (or whichever license you apply). Feel free to modify and distribute it according to your needs.
+The upstream repository did not include a license file. Confirm licensing with
+the repository owner before redistributing the code.

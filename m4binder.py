@@ -6,7 +6,7 @@ CLI script that:
   3) Embeds that metadata in the final M4B.
 
 Usage:
-  python audiobook_converter.py \
+  python m4binder.py \
       --input-folder /path/to/chapters \
       --output-file mybook.m4b \
       --title "Dune" \
@@ -28,12 +28,6 @@ from pathlib import Path
 from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC
-
-try:
-    from olclient.openlibrary import OpenLibrary
-    import olclient.common as ol_common
-except ImportError:
-    OpenLibrary = None
 
 import requests
 from tqdm import tqdm
@@ -92,14 +86,18 @@ def extract_id3_tags(file_path):
     except Exception:
         return {}
 
-def extract_embedded_cover_art(mp3_path):
+def extract_embedded_cover_art(mp3_path, output_folder=None):
     """
     Checks if an MP3 file has embedded cover art (APIC frame).
     If found, saves it to a file (next to the MP3) and returns the file path.
     Otherwise returns None.
     """
     # Load MP3 with ID3 tags
-    audio = MP3(mp3_path, ID3=ID3)
+    try:
+        audio = MP3(mp3_path, ID3=ID3)
+    except Exception as exc:
+        print(f"[WARN] Could not read embedded cover: {exc}")
+        return None
     if not audio.tags:
         return None
 
@@ -122,7 +120,7 @@ def extract_embedded_cover_art(mp3_path):
                 # Build a file path in the same folder as the MP3
                 base_name = os.path.splitext(os.path.basename(mp3_path))[0]
                 cover_filename = f"{base_name}_cover{extension}"
-                cover_path = os.path.join(os.path.dirname(mp3_path), cover_filename)
+                cover_path = os.path.join(output_folder or os.path.dirname(mp3_path), cover_filename)
 
                 # Write out the image data
                 with open(cover_path, "wb") as f:
@@ -208,6 +206,8 @@ def encode_mp3_to_m4a(mp3_file, out_file):
         "-i", mp3_file,       # Input MP3
         "-vn",                # This drops any video/art track that might be embedded as H.264:
         "-c:a", "aac",
+        "-ar", "44100",
+        "-ac", "2",
         out_file
     ]
     subprocess.run(cmd, check=True)
@@ -335,7 +335,7 @@ def _convert_mp3_chapters(input_folder, output_file, book_metadata, work,
         for m4a in m4a_files:
             os.remove(m4a)
 
-def get_book_metadata(args, mp3_files):
+def get_book_metadata(args, mp3_files, work_folder=None):
     """
     1) If user wants metadata from Google/OpenLibrary, fetch it.
     2) Otherwise, extract from first MP3 (ID3 tags) or fallback to defaults.
@@ -362,7 +362,7 @@ def get_book_metadata(args, mp3_files):
         book_meta = fetch_metadata_openlibrary(
             title=args.title or default_title,
             author=args.author or default_author,
-            input_folder=os.path.dirname(mp3_files[0])  # store cover near first MP3
+            input_folder=work_folder or os.path.dirname(mp3_files[0])
         )
     else:
         book_meta = None
@@ -372,13 +372,19 @@ def get_book_metadata(args, mp3_files):
         print(book_meta)
     else:
         # fallback: embedded cover from first MP3
-        cover_art = extract_embedded_cover_art(mp3_files[0])
+        cover_art = extract_embedded_cover_art(mp3_files[0], work_folder)
         book_meta = {
             "title": args.title or default_title,
             "authors": [args.author or default_author],
             "publisher": "",
             "cover": cover_art
         }
+    # Explicit user values take precedence over online matches.
+    book_meta["title"] = args.title or book_meta.get("title") or default_title or Path(mp3_files[0]).parent.name
+    book_meta["authors"] = ([args.author] if args.author else
+                            book_meta.get("authors") or ([default_author] if default_author else []))
+    if not book_meta.get("cover") and args.metadata_source != "none":
+        book_meta["cover"] = extract_embedded_cover_art(mp3_files[0], work_folder)
     return book_meta
 
 def fetch_metadata_google_books(title=None, author=None, isbn=None, api_key=None):
@@ -403,8 +409,13 @@ def fetch_metadata_google_books(title=None, author=None, isbn=None, api_key=None
     if api_key:
         params["key"] = api_key
 
-    resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params)
-    data = resp.json()
+    try:
+        resp = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[WARN] Google Books lookup failed; using local tags: {exc}")
+        return None
 
     items = data.get("items", [])
     if not items:
@@ -422,39 +433,45 @@ def fetch_metadata_google_books(title=None, author=None, isbn=None, api_key=None
     return metadata
 
 def fetch_metadata_openlibrary(title=None, author=None, input_folder=None):
-    """
-    Example stub using openlibrary-client (Requires pip install openlibrary-client).
-    You’ll need to adapt this to your actual usage pattern:
-      e.g., searching by ISBN, or calling the .get() method, etc.
-    """
-    if not OpenLibrary:
-        print("[WARN] openlibrary-client not installed. Skipping.")
+    """Search the public API with bounded requests and a local metadata fallback."""
+    if not title and not author:
         return None
-
     print("[INFO] Fetching metadata from Open Library...")
-    ol = OpenLibrary()
-    work_result = ol.Work.search(title=title, author=author)
-    if not work_result:
-        print("[WARN] No results from Open Library.")
+    params = {"limit": 1, "fields": "title,author_name,publisher,cover_i"}
+    if title:
+        params["title"] = title
+    if author:
+        params["author"] = author
+    try:
+        response = requests.get("https://openlibrary.org/search.json", params=params,
+                                timeout=15, headers={"User-Agent": "m4binder/1.0"})
+        response.raise_for_status()
+        docs = response.json().get("docs", [])
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[WARN] Open Library lookup failed; using local tags: {exc}")
         return None
-    work = ol.Work.get(work_result.identifiers['olid'][0])
-
-    # Covers are downloaded (with redirect following) using this format:
-    # https://covers.openlibrary.org/b/id/{cover_id}-L.jpg
-    cover_id = work.covers[0] if len(work.covers) > 0 else None
-    cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else None
-    # Fetch the cover image
-    if cover_url:
-        cover_resp = requests.get(cover_url, allow_redirects=True)
-        cover_path = f"{input_folder}/{cover_id}-cover.jpg"
-        with open(cover_path, 'wb') as f:
-            f.write(cover_resp.content)
-        print(f"[INFO] Saved cover image to {cover_path}")
+    if not docs:
+        print("[WARN] No results from Open Library; using local tags.")
+        return None
+    book = docs[0]
+    cover_path = None
+    cover_id = book.get("cover_i")
+    if cover_id and input_folder:
+        try:
+            response = requests.get(f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg?default=false",
+                                    timeout=15)
+            response.raise_for_status()
+            cover_path = os.path.join(input_folder, "openlibrary-cover.jpg")
+            with open(cover_path, "wb") as cover:
+                cover.write(response.content)
+        except (requests.RequestException, OSError) as exc:
+            print(f"[WARN] Could not download cover: {exc}")
+            cover_path = None
     return {
-        "title": work_result.title,
-        "authors": [auth['name'] for auth in work_result.authors],
-        "publisher": getattr(work_result, 'publisher', '') or '',
-        "cover": cover_path if cover_url else None,
+        "title": book.get("title"),
+        "authors": book.get("author_name") or [],
+        "publisher": ", ".join(book.get("publisher") or []),
+        "cover": cover_path,
     }
 
 def main():
@@ -501,16 +518,16 @@ def main():
             sys.exit(1)
 
         # Build metadata
-        book_meta = get_book_metadata(args, mp3_files)
-
         # If output-file not specified, pick a default
         if not args.output_file:
             # e.g. the folder name + ".m4b"
             folder_name = os.path.basename(args.input_folder.rstrip(os.sep))
             args.output_file = folder_name + ".m4b"
 
-        convert_mp3_chapters_to_m4b(args.input_folder, args.output_file, book_metadata=book_meta,
-                                    max_workers=args.workers, progress=not args.no_progress)
+        with tempfile.TemporaryDirectory(prefix="m4binder-metadata-") as work:
+            book_meta = get_book_metadata(args, mp3_files, work)
+            convert_mp3_chapters_to_m4b(args.input_folder, args.output_file, book_metadata=book_meta,
+                                        max_workers=args.workers, progress=not args.no_progress)
 
     # ============== MULTIPLE MODE ==============
     else:
@@ -538,14 +555,14 @@ def main():
             print(f"[INFO] Converting subfolder: {subdir}")
 
             # Build metadata
-            book_meta = get_book_metadata(args, mp3_files)
-
             # Construct output filename for each subfolder
             folder_name = os.path.basename(subdir.rstrip(os.sep))
             output_m4b = os.path.join(args.output_folder, folder_name + ".m4b")
 
-            convert_mp3_chapters_to_m4b(subdir, output_m4b, book_metadata=book_meta,
-                                        max_workers=args.workers, progress=not args.no_progress)
+            with tempfile.TemporaryDirectory(prefix="m4binder-metadata-") as work:
+                book_meta = get_book_metadata(args, mp3_files, work)
+                convert_mp3_chapters_to_m4b(subdir, output_m4b, book_metadata=book_meta,
+                                            max_workers=args.workers, progress=not args.no_progress)
             print(f"[INFO] Finished subfolder -> {output_m4b}")
 
 if __name__ == "__main__":

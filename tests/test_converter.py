@@ -4,15 +4,42 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import json
+import shutil
 import tempfile
 import unittest
 from concurrent.futures import Future
 from unittest.mock import patch
 
 import m4binder as app
+import requests
 
 
 class ConversionTests(unittest.TestCase):
+    def test_online_failure_falls_back_to_explicit_metadata(self):
+        args = argparse.Namespace(title="My title", author="My author", metadata_source="openlibrary")
+        with patch.object(app.requests, "get", side_effect=requests.Timeout("offline")), \
+                patch.object(app, "extract_embedded_cover_art", return_value=None):
+            metadata = app.get_book_metadata(args, ["book/1.mp3"])
+        self.assertEqual(metadata["title"], "My title")
+        self.assertEqual(metadata["authors"], ["My author"])
+
+    def test_openlibrary_search_handles_missing_authors_and_cover(self):
+        with patch.object(app.requests, "get") as get:
+            get.return_value.json.return_value = {"docs": [{"title": "Book"}]}
+            metadata = app.fetch_metadata_openlibrary(title="Book")
+            self.assertEqual(metadata["authors"], [])
+            self.assertIsNone(metadata["cover"])
+            self.assertEqual(get.call_args.kwargs["timeout"], 15)
+
+    def test_explicit_values_override_online_match(self):
+        args = argparse.Namespace(title="Chosen", author="Writer", metadata_source="openlibrary")
+        with patch.object(app, "fetch_metadata_openlibrary", return_value={"title": "Other", "authors": ["Someone"]}), \
+                patch.object(app, "extract_embedded_cover_art", return_value=None):
+            metadata = app.get_book_metadata(args, ["book/1.mp3"])
+        self.assertEqual(metadata["title"], "Chosen")
+        self.assertEqual(metadata["authors"], ["Writer"])
+
     def test_progress_tracks_completed_chapters_and_retains_order(self):
         with tempfile.TemporaryDirectory() as folder:
             for name in ("2.mp3", "10.mp3"):
@@ -88,6 +115,35 @@ class ConversionTests(unittest.TestCase):
                 app.convert_mp3_chapters_to_m4b(folder, output)
             self.assertEqual(output.read_bytes(), b"complete")
             self.assertFalse(list(Path(folder).glob("m4binder-*")))
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg and ffprobe required")
+class FFmpegIntegrationTests(unittest.TestCase):
+    def test_real_conversion_chapters_tags_and_source_preservation(self):
+        with tempfile.TemporaryDirectory(prefix="book's audio ") as folder:
+            for name, rate in (("2.MP3", "22050"), ("10.mp3", "44100")):
+                subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                                "sine=frequency=440:duration=0.5", "-ar", rate,
+                                str(Path(folder, name))], check=True)
+            from mutagen.easyid3 import EasyID3
+            tags = EasyID3(Path(folder, "2.MP3"))
+            tags["title"] = "First = chapter; #1"
+            tags.save()
+            before = {p.name: p.read_bytes() for p in Path(folder).iterdir()}
+            output = Path(folder, "output", "book.m4b")
+            app.convert_mp3_chapters_to_m4b(folder, output,
+                {"title": "Book = test", "authors": ["Writer"]}, max_workers=1, progress=False)
+            result = subprocess.run(["ffprobe", "-v", "error", "-show_chapters", "-show_format",
+                                     "-of", "json", str(output)], capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+            self.assertEqual(len(data["chapters"]), 2)
+            self.assertEqual(data["chapters"][0]["tags"]["title"], "First = chapter; #1")
+            self.assertEqual(data["chapters"][1]["tags"]["title"], "Chapter 2")
+            self.assertEqual(data["format"]["tags"]["title"], "Book = test")
+            self.assertGreater(float(data["format"]["duration"]), 0.9)
+            for name, content in before.items():
+                self.assertEqual(Path(folder, name).read_bytes(), content)
+            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()), sorted([*before, "output"]))
 
 
 if __name__ == "__main__":

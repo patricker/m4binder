@@ -19,6 +19,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import sys
 import subprocess
+import math
+import re
+import shutil
+import tempfile
+from pathlib import Path
 
 from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
@@ -50,11 +55,30 @@ def get_duration(file_path):
         text=True
     )
 
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        print(f"Warning: Could not determine duration of {file_path}.")
-        return 0.0
+    result.check_returncode()
+    duration = float(result.stdout.strip())
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"Invalid audio duration: {file_path}")
+    return duration
+
+
+def natural_key(path):
+    """Order chapter 2 before chapter 10, consistently across platforms."""
+    return tuple((1, int(part)) if part.isdigit() else (0, part.casefold())
+                 for part in re.split(r"(\d+)", str(path)))
+
+
+def find_mp3s(folder):
+    return sorted((str(p.resolve()) for p in Path(folder).iterdir()
+                   if p.is_file() and p.suffix.lower() == ".mp3"),
+                  key=lambda p: (natural_key(p), p))
+
+
+def escape_metadata(value):
+    value = str(value or "")
+    for char in ("\\", "=", ";", "#", "\n"):
+        value = value.replace(char, "\\" + char)
+    return value.replace("\r", "")
 
 def extract_id3_tags(file_path):
     """Return basic ID3 title/artist from an MP3 file."""
@@ -119,13 +143,14 @@ def create_ffmetadata(files, metadata_file, book_metadata=None):
     # If we have book metadata, inject it here.
     if book_metadata:
         if "title" in book_metadata:
-            lines.append(f"title={book_metadata['title']}")
-            lines.append(f"album={book_metadata['title']}")
+            lines.append(f"title={escape_metadata(book_metadata['title'])}")
+            lines.append(f"album={escape_metadata(book_metadata['title'])}")
         if "authors" in book_metadata and len(book_metadata['authors']) > 0 and book_metadata['authors'][0] is not None:
-            lines.append(f"artist={', '.join(book_metadata['authors'])}")
-            lines.append(f"album_artist={', '.join(book_metadata['authors'])}")
+            authors = escape_metadata(', '.join(a for a in book_metadata['authors'] if a))
+            lines.append(f"artist={authors}")
+            lines.append(f"album_artist={authors}")
         if "publisher" in book_metadata:
-            lines.append(f"publisher={book_metadata['publisher']}")
+            lines.append(f"publisher={escape_metadata(book_metadata['publisher'])}")
 
     current_start_ms = 0
     for idx, file_path in enumerate(files, start=1):
@@ -150,7 +175,7 @@ def create_ffmetadata(files, metadata_file, book_metadata=None):
         lines.append("TIMEBASE=1/1000")
         lines.append(f"START={chapter_start}")
         lines.append(f"END={chapter_end}")
-        lines.append(f"title={mp3_title}")
+        lines.append(f"title={escape_metadata(mp3_title)}")
 
         current_start_ms += duration_ms
 
@@ -177,6 +202,7 @@ def encode_mp3_to_m4a(mp3_file, out_file):
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
+        "-nostdin",
         "-y",                 # Overwrite output
         "-i", mp3_file,       # Input MP3
         "-vn",                # This drops any video/art track that might be embedded as H.264:
@@ -194,12 +220,7 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder, exist_ok=True)
 
-    mp3_files = [
-        os.path.join(input_folder, f)
-        for f in os.listdir(input_folder)
-        if f.lower().endswith(".mp3")
-    ]
-    mp3_files.sort()
+    mp3_files = find_mp3s(input_folder)
 
     results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -217,12 +238,28 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
                 fut.result()  # Will raise CalledProcessError if FFmpeg fails
                 results.append(out_file)
             except Exception as e:
-                print(f"Error encoding {out_file}: {e}")
+                raise RuntimeError(f"Error encoding {out_file}: {e}") from e
 
     # Return sorted list of .m4a files
-    return sorted(results), mp3_files
+    return sorted(results, key=lambda p: (natural_key(p), p)), mp3_files
 
 def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
+    """Publish only a complete book, preserving existing output files."""
+    output = Path(output_file).resolve()
+    if output.exists():
+        raise FileExistsError(f"Output already exists: {output}. Choose a new filename.")
+    if not find_mp3s(input_folder):
+        raise ValueError(f"No MP3 files found in {input_folder}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="m4binder-", dir=output.parent) as work:
+        staged = os.path.join(work, "audiobook.m4b")
+        _convert_mp3_chapters(input_folder, staged, book_metadata, work)
+        # Atomic publication that refuses to overwrite an existing file.
+        os.link(staged, output)
+    print(f"Created audiobook: {output}")
+
+
+def _convert_mp3_chapters(input_folder, output_file, book_metadata, work):
     """
     Main conversion flow:
       1) Find MP3s
@@ -230,10 +267,10 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
       3) Create concat list
       4) Use ffmpeg to produce final M4B
     """
-    m4a_files, mp3_files = parallel_encode_mp3s_to_m4a(input_folder, input_folder)
+    m4a_files, mp3_files = parallel_encode_mp3s_to_m4a(input_folder, work)
 
-    metadata_file = os.path.join(input_folder, "chapters.ffmetadata")
-    list_file = os.path.join(input_folder, "concat_list.txt")
+    metadata_file = os.path.join(work, "chapters.ffmetadata")
+    list_file = os.path.join(work, "concat_list.txt")
 
     create_ffmetadata(mp3_files, metadata_file, book_metadata=book_metadata)
     create_concat_list(m4a_files, list_file)
@@ -276,9 +313,8 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
 
     try:
         subprocess.run(ffmpeg_cmd, check=True)
-        print(f"Created audiobook: {output_file}")
     except subprocess.CalledProcessError as e:
-        print(f"Error converting MP3 chapters to M4B: {e}")
+        raise RuntimeError(f"Error assembling audiobook: {e}") from e
     finally:
         # Clean up
         if os.path.exists(metadata_file):
@@ -432,14 +468,16 @@ def main():
 
     args = parser.parse_args()
 
+    if not os.path.isdir(args.input_folder):
+        parser.error(f"Input folder does not exist: {args.input_folder}")
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            parser.error(f"{tool} is missing. Install FFmpeg and add its bin folder to PATH.")
+    args.output_folder = args.output_folder or args.input_folder
+
     # ============== SINGLE MODE ==============
     if args.mode == "single":
-        mp3_files = [
-            os.path.join(args.input_folder, f)
-            for f in os.listdir(args.input_folder)
-            if f.lower().endswith(".mp3")
-        ]
-        mp3_files.sort()
+        mp3_files = find_mp3s(args.input_folder)
 
         if not mp3_files:
             print("[ERROR] No MP3 files found in input folder.")
@@ -468,13 +506,8 @@ def main():
             print("[ERROR] No subfolders found in input folder for 'multiple' mode.")
             sys.exit(1)
 
-        for subdir in subfolders:
-            mp3_files = [
-                os.path.join(subdir, f)
-                for f in os.listdir(subdir)
-                if f.lower().endswith(".mp3")
-            ]
-            mp3_files.sort()
+        for subdir in sorted(subfolders, key=natural_key):
+            mp3_files = find_mp3s(subdir)
 
             if not mp3_files:
                 print(f"[WARN] No MP3 files in subfolder: {subdir}. Skipping.")
@@ -493,4 +526,11 @@ def main():
             print(f"[INFO] Finished subfolder -> {output_m4b}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[ERROR] Conversion interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)

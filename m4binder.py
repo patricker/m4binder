@@ -89,7 +89,7 @@ def extract_id3_tags(file_path):
 def extract_embedded_cover_art(mp3_path, output_folder=None):
     """
     Checks if an MP3 file has embedded cover art (APIC frame).
-    If found, saves it to a file (next to the MP3) and returns the file path.
+    If found, saves it in output_folder when supplied and returns its path.
     Otherwise returns None.
     """
     # Load MP3 with ID3 tags
@@ -194,8 +194,7 @@ def create_concat_list(file_paths, list_file):
 
 def encode_mp3_to_m4a(mp3_file, out_file):
     """
-    Convert a single MP3 file to AAC (.m4a) without altering 
-    sample rate/channels if possible.
+    Convert a single MP3 to AAC with a consistent sample rate and channel layout.
     """
     cmd = [
         "ffmpeg",
@@ -476,10 +475,19 @@ def fetch_metadata_openlibrary(title=None, author=None, input_folder=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert MP3 chapters to M4B with optional metadata fetching."
+        description="Convert naturally sorted MP3 chapters to an M4B audiobook.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Examples:
+  python m4binder.py --input-folder "My Book" --output-file "My Book.m4b" --metadata-source none
+  python m4binder.py --mode multiple --input-folder "Books" --output-folder "Converted"
+  python m4binder.py --input-folder "My Book" --workers 1 --no-progress
+
+Requires ffmpeg and ffprobe on PATH. Only immediate MP3 files are read.
+Progress updates when each chapter finishes; final assembly follows encoding.
+Existing outputs are refused. See README.md for setup and troubleshooting.'''
     )
     parser.add_argument("--input-folder", required=True, help="Folder containing MP3 chapters.")
-    parser.add_argument("--output-file", help="Output M4B filename (used in single mode).")
+    parser.add_argument("--output-file", help="Single mode output (default: folder name.m4b in current directory).")
 
     # New mode argument
     parser.add_argument("--mode",
@@ -490,9 +498,9 @@ def main():
     parser.add_argument("--metadata-source", default="openlibrary",
                         choices=["google", "openlibrary", "none"],
                         help="Source to fetch book metadata.")
-    parser.add_argument("--title", help="Book title (for metadata lookup).")
-    parser.add_argument("--author", help="Book author (for metadata lookup).")
-    parser.add_argument("--output-folder", help="Where to place M4B files in nested mode")
+    parser.add_argument("--title", help="Book title override, also used for online lookup.")
+    parser.add_argument("--author", help="Book author override, also used for online lookup.")
+    parser.add_argument("--output-folder", help="Multiple mode destination (default: input folder).")
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
                         help="Parallel FFmpeg processes (default: up to 4).")
     parser.add_argument("--no-progress", action="store_true",

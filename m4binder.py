@@ -36,6 +36,7 @@ except ImportError:
     OpenLibrary = None
 
 import requests
+from tqdm import tqdm
 
 def get_duration(file_path):
     """
@@ -211,7 +212,7 @@ def encode_mp3_to_m4a(mp3_file, out_file):
     ]
     subprocess.run(cmd, check=True)
 
-def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
+def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None, progress=True):
     """
     1) Finds all .mp3 in input_folder.
     2) Encodes each in parallel to .m4a in output_folder.
@@ -223,7 +224,7 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
     mp3_files = find_mp3s(input_folder)
 
     results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers or min(4, os.cpu_count() or 1)) as executor:
         futures = {}
         for mp3 in mp3_files:
             basename = os.path.splitext(os.path.basename(mp3))[0]
@@ -232,7 +233,8 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
             futures[fut] = out_file
 
         # Gather results (this blocks until all are done)
-        for fut in as_completed(futures):
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Encoding chapters",
+                        unit="chapter", disable=not progress):
             out_file = futures[fut]
             try:
                 fut.result()  # Will raise CalledProcessError if FFmpeg fails
@@ -243,7 +245,8 @@ def parallel_encode_mp3s_to_m4a(input_folder, output_folder, max_workers=None):
     # Return sorted list of .m4a files
     return sorted(results, key=lambda p: (natural_key(p), p)), mp3_files
 
-def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
+def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None,
+                                max_workers=None, progress=True):
     """Publish only a complete book, preserving existing output files."""
     output = Path(output_file).resolve()
     if output.exists():
@@ -253,13 +256,15 @@ def convert_mp3_chapters_to_m4b(input_folder, output_file, book_metadata=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="m4binder-", dir=output.parent) as work:
         staged = os.path.join(work, "audiobook.m4b")
-        _convert_mp3_chapters(input_folder, staged, book_metadata, work)
+        _convert_mp3_chapters(input_folder, staged, book_metadata, work,
+                              max_workers=max_workers, progress=progress)
         # Atomic publication that refuses to overwrite an existing file.
         os.link(staged, output)
     print(f"Created audiobook: {output}")
 
 
-def _convert_mp3_chapters(input_folder, output_file, book_metadata, work):
+def _convert_mp3_chapters(input_folder, output_file, book_metadata, work,
+                          max_workers=None, progress=True):
     """
     Main conversion flow:
       1) Find MP3s
@@ -267,11 +272,13 @@ def _convert_mp3_chapters(input_folder, output_file, book_metadata, work):
       3) Create concat list
       4) Use ffmpeg to produce final M4B
     """
-    m4a_files, mp3_files = parallel_encode_mp3s_to_m4a(input_folder, work)
+    m4a_files, mp3_files = parallel_encode_mp3s_to_m4a(
+        input_folder, work, max_workers=max_workers, progress=progress)
 
     metadata_file = os.path.join(work, "chapters.ffmetadata")
     list_file = os.path.join(work, "concat_list.txt")
 
+    print("[INFO] Building chapter markers...")
     create_ffmetadata(mp3_files, metadata_file, book_metadata=book_metadata)
     create_concat_list(m4a_files, list_file)
 
@@ -280,6 +287,8 @@ def _convert_mp3_chapters(input_folder, output_file, book_metadata, work):
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
+        "-nostdin",
+        "-n",
         "-f", "concat",
         "-safe", "0",
         "-i", list_file,
@@ -293,6 +302,7 @@ def _convert_mp3_chapters(input_folder, output_file, book_metadata, work):
     # 3) Now specify the mapping for each input and output options
     ffmpeg_cmd += [
         "-map_metadata", "1",  # the second input (metadata file)
+        "-map_chapters", "1",
         "-map", "0:a",         # the first input (audio from concat list)
         "-c", "copy",
         "-movflags", "faststart"
@@ -312,6 +322,7 @@ def _convert_mp3_chapters(input_folder, output_file, book_metadata, work):
     ffmpeg_cmd.append(output_file)
 
     try:
+        print("[INFO] Assembling audiobook and optimizing playback; please wait...")
         subprocess.run(ffmpeg_cmd, check=True)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Error assembling audiobook: {e}") from e
@@ -465,8 +476,14 @@ def main():
     parser.add_argument("--title", help="Book title (for metadata lookup).")
     parser.add_argument("--author", help="Book author (for metadata lookup).")
     parser.add_argument("--output-folder", help="Where to place M4B files in nested mode")
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                        help="Parallel FFmpeg processes (default: up to 4).")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable progress bars for logs or automation.")
 
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
     if not os.path.isdir(args.input_folder):
         parser.error(f"Input folder does not exist: {args.input_folder}")
@@ -492,7 +509,8 @@ def main():
             folder_name = os.path.basename(args.input_folder.rstrip(os.sep))
             args.output_file = folder_name + ".m4b"
 
-        convert_mp3_chapters_to_m4b(args.input_folder, args.output_file, book_metadata=book_meta)
+        convert_mp3_chapters_to_m4b(args.input_folder, args.output_file, book_metadata=book_meta,
+                                    max_workers=args.workers, progress=not args.no_progress)
 
     # ============== MULTIPLE MODE ==============
     else:
@@ -506,7 +524,11 @@ def main():
             print("[ERROR] No subfolders found in input folder for 'multiple' mode.")
             sys.exit(1)
 
-        for subdir in sorted(subfolders, key=natural_key):
+        book_folders = [d for d in sorted(subfolders, key=natural_key) if find_mp3s(d)]
+        if not book_folders:
+            parser.error("No MP3 files found in any immediate subfolder.")
+        for subdir in tqdm(book_folders, desc="Converting books", unit="book",
+                           disable=args.no_progress):
             mp3_files = find_mp3s(subdir)
 
             if not mp3_files:
@@ -522,7 +544,8 @@ def main():
             folder_name = os.path.basename(subdir.rstrip(os.sep))
             output_m4b = os.path.join(args.output_folder, folder_name + ".m4b")
 
-            convert_mp3_chapters_to_m4b(subdir, output_m4b, book_metadata=book_meta)
+            convert_mp3_chapters_to_m4b(subdir, output_m4b, book_metadata=book_meta,
+                                        max_workers=args.workers, progress=not args.no_progress)
             print(f"[INFO] Finished subfolder -> {output_m4b}")
 
 if __name__ == "__main__":

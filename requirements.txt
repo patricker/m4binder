@@ -1,2 +1,4 @@
 git+https://github.com/internetarchive/openlibrary-client.git
 mutagen
+requests>=2.31,<3
+tqdm>=4.66,<5
